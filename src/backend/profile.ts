@@ -319,7 +319,10 @@ export class ProfileFile {
 
 	private static customRegsLen = 256 * 2 + 4 /*chipsetFlags*/ + 4/*RefPtr*/;
 	private static agaColorsLen = 256 * 4;
-	private static sizeofDmaRec = 58;
+	/** Legacy format (WinUAE upstream): 58 bytes per dma_rec */
+	private static sizeofDmaRecLegacy = 58;
+	/** WinUAE-DBG (BartmanAbyss fork): extended struct with hpos, vpos, agnus_evt, etc. */
+	private static sizeofDmaRecExtended = 121;
 	private static sizeofResource = 52;
 
 	constructor(private buffer: Buffer) {
@@ -381,35 +384,25 @@ export class ProfileFile {
 			// DMA
 			const dmaLen = buffer.readUInt32LE(bufferOffset); bufferOffset += 4;
 			const dmaCount = buffer.readUInt32LE(bufferOffset); bufferOffset += 4;
-			if (dmaLen !== ProfileFile.sizeofDmaRec)
-				throw new Error(`<internal error> dmaLen mismatch (want ${ProfileFile.sizeofDmaRec}, got ${dmaLen})`);
+			if (dmaLen !== ProfileFile.sizeofDmaRecLegacy && dmaLen !== ProfileFile.sizeofDmaRecExtended)
+				throw new Error(`<internal error> dmaLen mismatch (want ${ProfileFile.sizeofDmaRecLegacy} or ${ProfileFile.sizeofDmaRecExtended}, got ${dmaLen})`);
 			if (dmaCount !== NR_DMA_REC_HPOS * NR_DMA_REC_VPOS)
 				throw new Error(`<internal error> dmaCount mismatch (${dmaCount} != ${NR_DMA_REC_HPOS * NR_DMA_REC_VPOS})`);
 			const dmaBuffer = Buffer.from(buffer.buffer, bufferOffset, dmaLen * dmaCount); bufferOffset += dmaLen * dmaCount;
+			const isExtended = dmaLen === ProfileFile.sizeofDmaRecExtended;
+			// Offsets: legacy (58 bytes) vs WinUAE-DBG extended (121 bytes, see include/debug.h struct dma_rec)
+			const o = isExtended ? { reg: 28, dat: 30, size: 38, addr: 40, evt: 44, type: 77, extra: 79, intlev: 81 } : { reg: 0, dat: 2, size: 10, addr: 12, evt: 16, type: 29, extra: 31, intlev: 33 };
 			for (let i = 0; i < dmaCount; i++) {
-				const reg = dmaBuffer.readUInt16LE(i * dmaLen + 0);
-				const dat = dmaBuffer.readUInt32LE(i * dmaLen + 2);
-				const datHi = dmaBuffer.readUInt32LE(i * dmaLen + 2 + 4);
-				const size = dmaBuffer.readUInt16LE(i * dmaLen + 10);
-				const addr = dmaBuffer.readUInt32LE(i * dmaLen + 12);
-				const evt = dmaBuffer.readUInt32LE(i * dmaLen + 16);
-				const evt2 = dmaBuffer.readUInt32LE(i * dmaLen + 20);
-				const evtdata = dmaBuffer.readUInt32LE(i * dmaLen + 24);
-				const evtdataset = dmaBuffer.readInt8(i * dmaLen + 28);
-				const type = dmaBuffer.readInt16LE(i * dmaLen + 29);
-				const extra = dmaBuffer.readUInt16LE(i * dmaLen + 31);
-				const intlev = dmaBuffer.readInt8(i * dmaLen + 33);
-				const ipl = dmaBuffer.readInt8(i * dmaLen + 34);
-				const ipl2 = dmaBuffer.readInt8(i * dmaLen + 35);
-				const cf_reg = dmaBuffer.readUInt16LE(i * dmaLen + 36);
-				const cf_dat = dmaBuffer.readUInt16LE(i * dmaLen + 38);
-				const cf_addr = dmaBuffer.readUInt16LE(i * dmaLen + 40);
-				const ciareg = dmaBuffer.readUInt32LE(i * dmaLen + 42);
-				const ciamask = dmaBuffer.readUInt32LE(i * dmaLen + 46);
-				const ciarw = dmaBuffer.readInt8(i * dmaLen + 50);
-				const ciaphase = dmaBuffer.readInt8(i * dmaLen + 51);
-				const ciavalue = dmaBuffer.readUInt16LE(i * dmaLen + 55);
-				const end = dmaBuffer.readInt8(i * dmaLen + 57);
+				const base = i * dmaLen;
+				const reg = dmaBuffer.readUInt16LE(base + o.reg);
+				const dat = dmaBuffer.readUInt32LE(base + o.dat);
+				const datHi = isExtended ? dmaBuffer.readUInt32LE(base + o.dat + 4) : dmaBuffer.readUInt32LE(base + o.dat + 4);
+				const size = dmaBuffer.readUInt16LE(base + o.size);
+				const addr = dmaBuffer.readUInt32LE(base + o.addr);
+				const evt = dmaBuffer.readUInt32LE(base + o.evt);
+				const type = dmaBuffer.readInt16LE(base + o.type);
+				const extra = dmaBuffer.readUInt16LE(base + o.extra);
+				const intlev = dmaBuffer.readInt8(base + o.intlev);
 
 				if (reg !== 0xffff) {
 					frame.dmaRecords.push({ reg, dat, datHi, size, addr, evt, type, extra, intlev });
@@ -720,11 +713,17 @@ export class Profiler {
 					let pc = p;
 					if (callstack.frames.length)
 						pc -= 2; // unwinding gets PC of next instruction, we want the previous!
-					const l = this.sourceMap.uniqueLines[this.sourceMap.lines[pc >> 1]];
-					for (let i = l.frames.length - 1; i >= 0; i--) {
-						callstack.frames.unshift({ ...l.frames[i] });
-						if (i !== 0)
-							callstack.frames[0].func += " (inlined)";
+					const lineIndex = pc >> 1;
+					const uniqueIndex = lineIndex >= 0 && lineIndex < this.sourceMap.lines.length ? this.sourceMap.lines[lineIndex] : undefined;
+					const l = uniqueIndex !== undefined ? this.sourceMap.uniqueLines[uniqueIndex] : undefined;
+					if (!l?.frames?.length) {
+						callstack.frames.push({ func: '[Unknown]', file: '', line: 0 });
+					} else {
+						for (let i = l.frames.length - 1; i >= 0; i--) {
+							callstack.frames.unshift({ ...l.frames[i] });
+							if (i !== 0)
+								callstack.frames[0].func += " (inlined)";
+						}
 					}
 				}
 			} else { // #Cycles
