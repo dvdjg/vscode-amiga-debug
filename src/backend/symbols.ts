@@ -117,16 +117,65 @@ export class SymbolTable {
 	}
 
 	public relocate(relocatedSections: Section[]) {
+		console.log(`SymbolTable.relocate: Received ${relocatedSections.length} relocated sections`);
 		relocatedSections.forEach((relocatedSection) => {
+			console.log(`  Input: ${relocatedSection.name} -> 0x${relocatedSection.address.toString(16)}`);
 			const section = this.sections.find((s) => s.name === relocatedSection.name);
-			if(section)
+			if(section) {
+				console.log(`  Found matching section ${section.name}, updating address from 0x${section.address.toString(16)} to 0x${relocatedSection.address.toString(16)}`);
 				section.address = relocatedSection.address;
+			} else {
+				console.log(`  WARNING: No matching section found for ${relocatedSection.name}`);
+			}
 		});
 
+		console.log(`SymbolTable.relocate: Updating ${this.symbols.length} symbol bases`);
+		let updatedCount = 0;
 		this.symbols.forEach((symbol) => {
 			const section = this.sections.find((s) => s.name === symbol.section);
-			if(section)
-				symbol.base = section.address/* - section.vma*/;
+			if(section) {
+				symbol.base = section.address;
+				updatedCount++;
+			}
+		});
+		console.log(`SymbolTable.relocate: Updated ${updatedCount} symbols`);
+		
+		// Log first few functions for verification
+		const funcs = this.symbols.filter(s => s.type === 0).slice(0, 5); // SymbolType.Function = 0
+		funcs.forEach(f => {
+			console.log(`  Sample func: ${f.name} addr=0x${f.address.toString(16)} base=0x${f.base.toString(16)} -> relocated=0x${(f.address + f.base).toString(16)}`);
+		});
+	}
+	
+	// Alternative relocation method: apply a fixed offset to all ALLOC sections
+	public relocateWithOffset(loadOffset: number) {
+		console.log(`SymbolTable.relocateWithOffset: Applying offset 0x${loadOffset.toString(16)}`);
+		let sectionCount = 0;
+		for(const section of this.sections) {
+			if(section.flags && section.flags.find((v) => v === "ALLOC") && section.size > 0) {
+				const oldAddr = section.address;
+				section.address = section.vma + loadOffset;
+				console.log(`  Section ${section.name}: 0x${oldAddr.toString(16)} -> 0x${section.address.toString(16)}`);
+				sectionCount++;
+			}
+		}
+		console.log(`SymbolTable.relocateWithOffset: Relocated ${sectionCount} sections`);
+		
+		// Update symbol bases
+		let symbolCount = 0;
+		this.symbols.forEach((symbol) => {
+			const section = this.sections.find((s) => s.name === symbol.section);
+			if(section) {
+				symbol.base = section.address;
+				symbolCount++;
+			}
+		});
+		console.log(`SymbolTable.relocateWithOffset: Updated ${symbolCount} symbol bases`);
+		
+		// Log first few functions for verification
+		const funcs = this.symbols.filter(s => s.type === SymbolType.Function).slice(0, 5);
+		funcs.forEach(f => {
+			console.log(`  Sample func: ${f.name} addr=0x${f.address.toString(16)} base=0x${f.base.toString(16)} -> relocated=0x${(f.address + f.base).toString(16)}`);
 		});
 	}
 
@@ -145,14 +194,26 @@ export class SymbolTable {
 	}
 
 	public getFunctionAtAddress(address: number, relocated: boolean): SymbolInformation | null {
+		console.log(`SymbolTable.getFunctionAtAddress: Looking for 0x${address.toString(16)}, relocated=${relocated}`);
 		const matches = this.symbols.filter((s) => {
 			let symAddress = s.address;
 			if(relocated)
 				symAddress += s.base;
 			return s.type === SymbolType.Function && symAddress <= address && (symAddress + s.size) > address;
 		});
-		if (!matches || matches.length === 0) { return null; }
+		if (!matches || matches.length === 0) {
+			// Log some nearby functions for debugging
+			const functions = this.symbols.filter(s => s.type === SymbolType.Function);
+			const nearby = functions.slice(0, 3);
+			console.log(`  No match found. Sample functions:`);
+			nearby.forEach(f => {
+				const base = relocated ? f.base : 0;
+				console.log(`    ${f.name}: addr=0x${f.address.toString(16)} base=0x${base.toString(16)} -> 0x${(f.address + base).toString(16)} size=${f.size}`);
+			});
+			return null;
+		}
 
+		console.log(`  Found: ${matches[0].name}`);
 		return matches[0];
 	}
 

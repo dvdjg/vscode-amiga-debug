@@ -58,14 +58,59 @@ export class MI2 extends EventEmitter implements IBackend {
 			const promises: Thenable<any>[] = commands.map((c) => this.sendCommand(c));
 			promises.push(asyncPromise);
 
-			if(executable !== '') {
-				const sectionsPromise = this.getSections().then((sections) => {
-					this.emit("sections-loaded", sections);
-				});
-				promises.push(sectionsPromise);
-			}
-
-			Promise.all(promises).then(() => {
+			// Execute commands first (including target remote), then get sections
+			// This ensures qOffsets has been processed by GDB before we query sections
+			Promise.all(promises).then(async () => {
+				if(executable !== '') {
+					// Get ELF sections from info file
+					const sections = await this.getSections();
+					
+					// Always log section info for debugging
+					this.log("log", `MI2: Got ${sections.length} sections from info file`);
+					sections.forEach(s => this.log("log", `  Section: ${s.name} addr=0x${s.address.toString(16)} size=0x${s.size.toString(16)}`));
+					
+					// Get load offset from WinUAE via qOffsets packet
+					// The first address is the .text base, from which we calculate the load offset
+					// ELF .text starts at 0x400, so loadOffset = textBase - 0x400
+					const ELF_TEXT_BASE = 0x400;
+					let loadOffset = 0;
+					try {
+						const qOffsetsNode = await this.sendUserInput('maintenance packet qOffsets');
+						this.log("log", `MI2: qOffsets raw output: ${JSON.stringify(qOffsetsNode?.output)}`);
+						if (qOffsetsNode && qOffsetsNode.output) {
+							const text = qOffsetsNode.output.join('');
+							this.log("log", `MI2: qOffsets joined text: "${text}"`);
+							// Parse: received: "00c44f50;..." - first value is text base
+							const match = /received:\s*"([0-9a-fA-F]+)/.exec(text);
+							this.log("log", `MI2: qOffsets regex match: ${JSON.stringify(match)}`);
+							if (match) {
+								const textBase = parseInt(match[1], 16);
+								loadOffset = textBase - ELF_TEXT_BASE;
+								this.log("log", `MI2: qOffsets textBase=0x${textBase.toString(16)}, loadOffset=0x${loadOffset.toString(16)}`);
+								
+								// Apply load offset to all sections
+								// This assumes all sections are relocated by the same offset
+								if (loadOffset > 0) {
+									for (const section of sections) {
+										const oldAddr = section.address;
+										section.address += loadOffset;
+										this.log("log", `MI2: Relocated ${section.name}: 0x${oldAddr.toString(16)} -> 0x${section.address.toString(16)}`);
+									}
+								}
+							} else {
+								this.log("log", `MI2: qOffsets regex did not match!`);
+							}
+						}
+					} catch (e) {
+						// qOffsets not available, use sections as-is
+						this.log("log", `MI2: Failed to get qOffsets: ${e}`);
+					}
+					
+					this.log("log", `MI2: Emitting sections-loaded with ${sections.length} sections and loadOffset=0x${loadOffset.toString(16)}`);
+					sections.forEach(s => this.log("log", `  Final: ${s.name} addr=0x${s.address.toString(16)}`));
+					// Emit both sections and loadOffset - loadOffset is more reliable for relocation
+					this.emit("sections-loaded", sections, loadOffset);
+				}
 				this.emit("debug-ready");
 				resolve();
 			}, reject);

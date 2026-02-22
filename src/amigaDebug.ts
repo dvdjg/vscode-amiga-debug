@@ -108,6 +108,8 @@ export class AmigaDebugSession extends LoggingDebugSession {
 
 	private args: LaunchRequestArguments;
 	private symbolTable: SymbolTable;
+	private loadOffset = 0;  // Offset to convert Amiga addresses to ELF addresses
+	private addr2linePath = '';  // Path to addr2line tool
 
 	// we may need to temporarily stop the target when setting breakpoints; don't let VSCode let it know though,
 	// it will send requests for threads and registers, they will fail because we already continued..
@@ -120,6 +122,62 @@ export class AmigaDebugSession extends LoggingDebugSession {
 
 	public constructor() {
 		super("amiga-debug.txt");
+	}
+
+	// Get source file and line from an Amiga address using addr2line
+	private getSourceInfoFromAddress(amigaAddress: number): { file: string; line: number; func: string } | null {
+		console.log(`getSourceInfoFromAddress: addr=0x${amigaAddress.toString(16)} loadOffset=0x${this.loadOffset.toString(16)} addr2linePath=${this.addr2linePath} program=${this.args?.program}`);
+		
+		if (!this.addr2linePath || !this.args?.program || this.loadOffset <= 0) {
+			console.log(`getSourceInfoFromAddress: Early exit - missing requirements`);
+			return null;
+		}
+		
+		// Convert Amiga address to ELF address
+		const elfAddress = amigaAddress - this.loadOffset;
+		if (elfAddress < 0) {
+			console.log(`getSourceInfoFromAddress: elfAddress negative: ${elfAddress}`);
+			return null;
+		}
+		
+		try {
+			const elfPath = this.args.program + '.elf';
+			console.log(`getSourceInfoFromAddress: Calling addr2line with elfPath=${elfPath} elfAddr=0x${elfAddress.toString(16)}`);
+			const result = childProcess.spawnSync(this.addr2linePath, [
+				'--functions',
+				'--demangle',
+				`--exe=${elfPath}`,
+				`0x${elfAddress.toString(16)}`
+			], { timeout: 5000 });
+			
+			if (result.status !== 0) {
+				console.log(`addr2line failed: status=${result.status} stderr=${result.stderr?.toString()}`);
+				return null;
+			}
+			
+			const output = result.stdout.toString().trim().split('\n');
+			console.log(`addr2line output: ${JSON.stringify(output)}`);
+			if (output.length >= 2) {
+				const func = output[0];
+				const fileLine = output[1];
+				const colonIndex = fileLine.lastIndexOf(':');
+				if (colonIndex > 0) {
+					const file = fileLine.substring(0, colonIndex);
+					const line = parseInt(fileLine.substring(colonIndex + 1), 10);
+					
+					// Check for valid output (not "??:0" or "??:?")
+					if (file !== '??' && !isNaN(line) && line > 0) {
+						console.log(`addr2line SUCCESS: 0x${amigaAddress.toString(16)} -> ${func} at ${file}:${line}`);
+						return { file, line, func };
+					} else {
+						console.log(`addr2line: Invalid output file='${file}' line=${line}`);
+					}
+				}
+			}
+		} catch (e) {
+			console.log(`addr2line error: ${e}`);
+		}
+		return null;
 	}
 
 	protected initDebugger() {
@@ -162,6 +220,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 
 		const binPath: string = await vscode.commands.executeCommand("amiga.bin-path");
 		const objdumpPath = path.join(binPath, "opt/bin/m68k-amiga-elf-objdump");
+		this.addr2linePath = path.join(binPath, "opt/bin/m68k-amiga-elf-addr2line");
 		const dh0Path = path.join(binPath, "..", "dh0");
 
 		const gdbPath = path.join(binPath, "opt/bin/m68k-amiga-elf-gdb");
@@ -578,9 +637,20 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			this.miDebugger.trace = true;
 		}
 
-		this.miDebugger.once('sections-loaded', (sections: Section[]) => {
+		this.miDebugger.once('sections-loaded', (sections: Section[], loadOffset?: number) => {
+			console.log(`amigaDebug: sections-loaded received, ${sections.length} sections, loadOffset=0x${(loadOffset ?? 0).toString(16)}`);
 			if(sections.length > 0) {
-				this.symbolTable.relocate(sections);
+				// Store loadOffset for address conversion in stack traces
+				this.loadOffset = loadOffset ?? 0;
+				
+				// Use loadOffset for more reliable relocation if available
+				if(loadOffset && loadOffset > 0) {
+					console.log(`amigaDebug: Using relocateWithOffset(0x${loadOffset.toString(16)})`);
+					this.symbolTable.relocateWithOffset(loadOffset);
+				} else {
+					console.log(`amigaDebug: Using relocate() with section names`);
+					this.symbolTable.relocate(sections);
+				}
 				this.started = true;
 				this.sendResponse(response);
 			} else {
@@ -1412,8 +1482,25 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			for (const element of stack) {
 				const stackId = (args.threadId << 8 | (element.level & 0xFF)) & 0xFFFF;
 				let file;
+				let line = element.line;
 				let disassemble = this.forceDisassembly || element.file === undefined;
-				if (!disassemble) {
+				
+				// If GDB doesn't have file info, try to get it from addr2line
+				if (disassemble && !this.forceDisassembly && element.file === undefined) {
+					const address = parseInt(element.address.substr(2), 16);
+					const sourceInfo = this.getSourceInfoFromAddress(address);
+					if (sourceInfo) {
+						file = sourceInfo.file;
+						line = sourceInfo.line;
+						element.function = sourceInfo.func;
+						disassemble = !(await this.checkFileExists(file));
+						if (!disassemble) {
+							console.log(`stackTrace: Using addr2line for 0x${address.toString(16)} -> ${file}:${line}`);
+						}
+					}
+				}
+				
+				if (!disassemble && !file) {
 					file = element.file;
 					disassemble = !(await this.checkFileExists(file));
 				}
@@ -1484,7 +1571,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 						ret.push(new StackFrame(stackId, element.address, new Source(fname, url), 1, 0));
 					}
 				} else {
-					ret.push(new StackFrame(stackId, element.function + '@' + element.address, this.createSource(file), element.line, 0));
+					ret.push(new StackFrame(stackId, element.function + '@' + element.address, this.createSource(file), line, 0));
 				}
 			}
 
