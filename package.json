@@ -549,7 +549,9 @@
 		"vscode:prepublish": "webpack --mode=production",
 		"compile": "webpack --mode=development",
 		"watch": "webpack --watch --mode=development",
-		"lint": "eslint -c .eslintrc.js --ext .ts,.tsx src"
+		"lint": "eslint -c .eslintrc.js --ext .ts,.tsx src",
+		"deploy": "node scripts/deploy-to-cursor.mjs",
+		"build:deploy": "npm run compile && npm run deploy"
 	},
 	"devDependencies": {
 		"@types/glob": "^8.1.0",

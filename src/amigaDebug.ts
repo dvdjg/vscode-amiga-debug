@@ -39,6 +39,7 @@ interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
 	slowmem?: string; // '0', '512k', '1M', '1.8M'
 	ntsc?: boolean; // NTSC mode
 	emuargs?: string[]; // Additional CLI arguments for emulator
+	breakpointRelocation?: boolean; // Enable extension-side breakpoint relocation (default: true)
 }
 
 class ExtendedVariable {
@@ -110,6 +111,10 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	private symbolTable: SymbolTable;
 	private loadOffset = 0;  // Offset to convert Amiga addresses to ELF addresses
 	private addr2linePath = '';  // Path to addr2line tool
+	
+	// Pending breakpoints to be relocated after loadOffset is known
+	private pendingBreakpoints: Array<{ file: string; line: number; condition?: string; hitCondition?: string }> = [];
+	private breakpointRelocationEnabled = true;  // Can be disabled via launch.json
 
 	// we may need to temporarily stop the target when setting breakpoints; don't let VSCode let it know though,
 	// it will send requests for threads and registers, they will fail because we already continued..
@@ -178,6 +183,95 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			console.log(`addr2line error: ${e}`);
 		}
 		return null;
+	}
+
+	// Get ELF address for a source file:line using GDB's info line command
+	private async getAddressForFileLine(file: string, line: number): Promise<number | null> {
+		try {
+			// Use GDB's info line to get the address
+			const result = await this.miDebugger.sendCommand(`-interpreter-exec console "info line ${file}:${line}"`);
+			console.log(`getAddressForFileLine: ${file}:${line} -> ${JSON.stringify(result)}`);
+			
+			// Parse the response to extract the address
+			// Format: "Line X of \"file\" starts at address 0xADDR ..."
+			const output = result.result('~') || '';
+			const match = output.match(/starts at address (0x[0-9a-fA-F]+)/);
+			if (match) {
+				const addr = parseInt(match[1], 16);
+				console.log(`getAddressForFileLine: Found address 0x${addr.toString(16)} for ${file}:${line}`);
+				return addr;
+			}
+		} catch (e) {
+			console.log(`getAddressForFileLine error: ${e}`);
+		}
+		return null;
+	}
+
+	// Re-establish breakpoints with relocated addresses after loadOffset is known
+	private async relocateBreakpoints(): Promise<void> {
+		if (this.pendingBreakpoints.length === 0 || this.loadOffset <= 0) {
+			return;
+		}
+		
+		console.log(`relocateBreakpoints: Relocating ${this.pendingBreakpoints.length} pending breakpoints with loadOffset=0x${this.loadOffset.toString(16)}`);
+		
+		for (const pending of this.pendingBreakpoints) {
+			try {
+				const elfAddr = await this.getAddressForFileLine(pending.file, pending.line);
+				if (elfAddr !== null) {
+					const amigaAddr = elfAddr + this.loadOffset;
+					console.log(`relocateBreakpoints: ${pending.file}:${pending.line} -> ELF 0x${elfAddr.toString(16)} -> Amiga 0x${amigaAddr.toString(16)}`);
+					
+					// Remove old breakpoint and add new one with absolute address
+					await this.miDebugger.addBreakpoint({
+						raw: `0x${amigaAddr.toString(16)}`,
+						condition: pending.condition
+					});
+				}
+			} catch (e) {
+				console.log(`relocateBreakpoints error for ${pending.file}:${pending.line}: ${e}`);
+			}
+		}
+		
+		this.pendingBreakpoints = [];
+	}
+
+	// Re-query qOffsets to get loadOffset (called when stopped and loadOffset is still 0)
+	// This is needed because qOffsets may fail initially if the process wasn't loaded yet,
+	// but AUTODETECT in WinUAE should have detected baseText by the time we hit a breakpoint
+	private async refreshLoadOffset(): Promise<void> {
+		const ELF_TEXT_BASE = 0x400;
+		try {
+			const qOffsetsNode = await this.miDebugger.sendUserInput('maintenance packet qOffsets');
+			console.log(`refreshLoadOffset: qOffsets raw output: ${JSON.stringify(qOffsetsNode?.output)}`);
+			if (qOffsetsNode && qOffsetsNode.output) {
+				const text = qOffsetsNode.output.join('');
+				console.log(`refreshLoadOffset: qOffsets joined text: "${text}"`);
+				// Parse: received: "00c44f50;..." - first value is text base
+				// Reject GDB error codes like "E01" - they parse as hex but are invalid
+				const match = /received:\s*"([0-9a-fA-F]+)/.exec(text);
+				if (match) {
+					const raw = match[1];
+					const isGdbError = raw.length <= 4 || /^E[0-9a-fA-F]{1,2}$/i.test(raw);
+					if (isGdbError) {
+						console.log(`refreshLoadOffset: Rejected GDB error code "${raw}"`);
+						return;
+					}
+					const textBase = parseInt(raw, 16);
+					this.loadOffset = textBase - ELF_TEXT_BASE;
+					console.log(`refreshLoadOffset: SUCCESS! textBase=0x${textBase.toString(16)}, loadOffset=0x${this.loadOffset.toString(16)}`);
+					
+					// Also update symbolTable
+					if (this.loadOffset > 0) {
+						this.symbolTable.relocateWithOffset(this.loadOffset);
+					}
+				} else {
+					console.log(`refreshLoadOffset: qOffsets regex did not match`);
+				}
+			}
+		} catch (e) {
+			console.log(`refreshLoadOffset: Failed to get qOffsets: ${e}`);
+		}
 	}
 
 	protected initDebugger() {
@@ -568,6 +662,11 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		this.symbolTable = new SymbolTable(objdumpPath, args.program + ".elf");
 		this.breakpointMap = new Map();
 		this.fileExistsCache = new Map();
+		
+		// Initialize breakpoint relocation flag (default: true)
+		this.breakpointRelocationEnabled = args.breakpointRelocation !== false;
+		this.pendingBreakpoints = [];
+		console.log(`amigaDebug: breakpointRelocationEnabled=${this.breakpointRelocationEnabled}`);
 
 		const ssPath = path.join(dh0Path, "s/startup-sequence");
 		try {
@@ -637,7 +736,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			this.miDebugger.trace = true;
 		}
 
-		this.miDebugger.once('sections-loaded', (sections: Section[], loadOffset?: number) => {
+		this.miDebugger.once('sections-loaded', async (sections: Section[], loadOffset?: number) => {
 			console.log(`amigaDebug: sections-loaded received, ${sections.length} sections, loadOffset=0x${(loadOffset ?? 0).toString(16)}`);
 			if(sections.length > 0) {
 				// Store loadOffset for address conversion in stack traces
@@ -647,6 +746,12 @@ export class AmigaDebugSession extends LoggingDebugSession {
 				if(loadOffset && loadOffset > 0) {
 					console.log(`amigaDebug: Using relocateWithOffset(0x${loadOffset.toString(16)})`);
 					this.symbolTable.relocateWithOffset(loadOffset);
+					
+					// OPTION A: Re-establish pending breakpoints with relocated addresses
+					if(this.breakpointRelocationEnabled && this.pendingBreakpoints.length > 0) {
+						console.log(`amigaDebug: Relocating ${this.pendingBreakpoints.length} pending breakpoints...`);
+						await this.relocateBreakpoints();
+					}
 				} else {
 					console.log(`amigaDebug: Using relocate() with section names`);
 					this.symbolTable.relocate(sections);
@@ -1088,9 +1193,17 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		this.sendEvent(new CustomContinuedEvent(this.currentThreadId, true));
 	}
 
-	protected breakpointEvent(info: MINode) {
+	protected async breakpointEvent(info: MINode) {
 		this.stopped = true;
 		this.stoppedReason = 'breakpoint';
+		
+		// FIX: If loadOffset is 0, try to re-query qOffsets now that we've hit a breakpoint
+		// The process should be loaded and AUTODETECT in WinUAE should have detected baseText
+		if (this.loadOffset <= 0) {
+			console.log('breakpointEvent: loadOffset is 0, re-querying qOffsets...');
+			await this.refreshLoadOffset();
+		}
+		
 		if(!this.disableSendStoppedEvents) {
 			this.sendEvent(new StoppedEvent(this.stoppedReason, this.currentThreadId));
 			this.sendEvent(new CustomStoppedEvent(this.stoppedReason, this.currentThreadId));
@@ -1319,8 +1432,22 @@ export class AmigaDebugSession extends LoggingDebugSession {
 					// real source
 					if (args.breakpoints) {
 						args.breakpoints.forEach((brk) => {
+							const file = args.source.path || "";
+							
+							// Save for potential relocation after loadOffset is known
+							if (this.breakpointRelocationEnabled) {
+								this.pendingBreakpoints.push({
+									file,
+									line: brk.line,
+									condition: brk.condition,
+									hitCondition: brk.hitCondition
+								});
+								console.log(`setBreakPointsRequest: Saved pending BP ${file}:${brk.line} (loadOffset=0x${this.loadOffset.toString(16)})`);
+							}
+							
+							// Still add the breakpoint normally (GDB will try file:line)
 							all.push(this.miDebugger.addBreakpoint({
-								file: args.source.path || "",
+								file,
 								line: brk.line,
 								condition: brk.condition,
 								countCondition: brk.hitCondition

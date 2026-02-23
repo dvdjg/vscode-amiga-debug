@@ -1,0 +1,25 @@
+---
+description: Desplegar extensión en Cursor tras modificar código
+globs: src/**/*.ts, src/**/*.tsx, webpack.config.js
+alwaysApply: true
+---
+
+# Despliegue de la extensión en Cursor
+
+**Cursor carga extensiones desde `~/.cursor/extensions/`**, no desde `~/.vscode/extensions/`.
+
+Cuando modifiques cualquier archivo de la extensión (src/, webpack.config.js):
+
+1. Ejecutar desde la raíz de vscode-amiga-debug:
+   ```
+   npm run build:deploy
+   ```
+   Esto compila y copia `dist/extension.js`, `dist/debugAdapter.js` y `dist/client.js` a la extensión instalada en Cursor.
+
+2. Decir al usuario que recargue la ventana de Cursor:
+   `Ctrl+Shift+P` → "Developer: Reload Window"
+
+Si solo necesitas desplegar sin compilar (por ejemplo, dist/ ya está actualizado):
+```
+npm run deploy
+```

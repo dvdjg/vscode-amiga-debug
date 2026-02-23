@@ -81,14 +81,20 @@ export class MI2 extends EventEmitter implements IBackend {
 							const text = qOffsetsNode.output.join('');
 							this.log("log", `MI2: qOffsets joined text: "${text}"`);
 							// Parse: received: "00c44f50;..." - first value is text base
+							// Reject GDB error codes like "E01" (process not found) - they parse as hex but are invalid
 							const match = /received:\s*"([0-9a-fA-F]+)/.exec(text);
 							this.log("log", `MI2: qOffsets regex match: ${JSON.stringify(match)}`);
 							if (match) {
-								const textBase = parseInt(match[1], 16);
-								loadOffset = textBase - ELF_TEXT_BASE;
-								this.log("log", `MI2: qOffsets textBase=0x${textBase.toString(16)}, loadOffset=0x${loadOffset.toString(16)}`);
+								const raw = match[1];
+								const isGdbError = raw.length <= 4 || /^E[0-9a-fA-F]{1,2}$/i.test(raw);
+								if (isGdbError) {
+									this.log("log", `MI2: qOffsets rejected GDB error code "${raw}", keeping loadOffset=0`);
+								} else {
+									const textBase = parseInt(raw, 16);
+									loadOffset = textBase - ELF_TEXT_BASE;
+									this.log("log", `MI2: qOffsets textBase=0x${textBase.toString(16)}, loadOffset=0x${loadOffset.toString(16)}`);
 								
-								// Apply load offset to all sections
+									// Apply load offset to all sections
 								// This assumes all sections are relocated by the same offset
 								if (loadOffset > 0) {
 									for (const section of sections) {
@@ -96,6 +102,7 @@ export class MI2 extends EventEmitter implements IBackend {
 										section.address += loadOffset;
 										this.log("log", `MI2: Relocated ${section.name}: 0x${oldAddr.toString(16)} -> 0x${section.address.toString(16)}`);
 									}
+								}
 								}
 							} else {
 								this.log("log", `MI2: qOffsets regex did not match!`);
