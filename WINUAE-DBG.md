@@ -21,3 +21,9 @@ npm run compile
 Then install the VSIX or copy `dist/` into your extension folder, or use **Extension Development Host** (F5) from this repo.
 
 Upstream: [BartmanAbyss/vscode-amiga-debug](https://github.com/BartmanAbyss/vscode-amiga-debug)
+
+## Background (for upstream / Bartman)
+
+Full write-up of why WinUAE-DBG needed profiler export fixes and what this fork changes in the extension:
+
+[WinUAE-DBG/docs/amiga-debug-profile-compatibility.md](https://github.com/dvdjg/WinUAE-DBG/blob/main/docs/amiga-debug-profile-compatibility.md).
