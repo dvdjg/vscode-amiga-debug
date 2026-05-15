@@ -196,7 +196,7 @@ const DeniseScreen: FunctionComponent<{
 
 	const aga = (MODELS[0].amiga.chipsetFlags & ChipsetFlags.AGA) !== 0;
 
-	const [pixelSources, pixelPtrs, pixels, pixelsRgb, pixelsDma, pixelsCopper] = useMemo(() => getScreen(scale, MODELS[frame], state.freeze !== -1 ? MODELS[state.freeze] : MODELS[frame], time, state), [scale, frame, state.freeze !== -1 ? time : 0, state]);
+	const [pixelSources, pixelPtrs, pixels, pixelsRgb, pixelsDma, pixelsCopper] = useMemo(() => getScreen(scale, MODELS[frame], state.freeze !== -1 ? MODELS[state.freeze] : MODELS[frame], time, state), [scale, frame, time, state]);
 
 	useEffect(() => { // screen canvas
 		const context = canvas.current?.getContext('2d');
