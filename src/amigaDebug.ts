@@ -115,6 +115,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	private stopped = false;
 	private stoppedReason = '';
 	private stoppedEventPending = false;
+	private relocationPromise: Promise<void> | null = null;
 
 	private currentFile: string;
 
@@ -594,6 +595,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		});
 		const commands = [
 			'enable-pretty-printing',
+			'gdb-set breakpoint always-inserted on',
 			//'interpreter-exec console "set debug remote 1"',
 			'interpreter-exec console "target remote localhost:2345"',
 		];
@@ -1018,6 +1020,24 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		this.sendEvent(new CustomContinuedEvent(this.currentThreadId, true));
 	}
 
+	private markContinuing() {
+		this.stopped = false;
+		this.stoppedEventPending = false;
+	}
+
+	private async refreshRelocation(): Promise<void> {
+		try {
+			const offsets = await this.miDebugger.getOffsets();
+			if(offsets.length === 0) {
+				return;
+			}
+			const relocatedSections = this.symbolTable.getRelocatedSections(offsets);
+			this.symbolTable.relocate(relocatedSections);
+		} catch(e) {
+			this.msgEvent('log', `Unable to refresh relocated sections: ${e.toString()}\n`);
+		}
+	}
+
 	protected breakpointEvent(info: MINode) {
 		this.stopped = true;
 		this.stoppedReason = 'breakpoint';
@@ -1095,6 +1115,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 				this.firstBreak = false;
 				this.stopped = true;
 				this.stoppedReason = 'entry';
+				this.relocationPromise = this.refreshRelocation();
 				// configurationDoneEvent will issue a 'continue' command
 			} else {
 				this.stopped = true;
@@ -1137,6 +1158,10 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	protected setFunctionBreakPointsRequest(response: DebugProtocol.SetFunctionBreakpointsResponse, args: DebugProtocol.SetFunctionBreakpointsArguments): void {
 		const createBreakpoints = async (shouldContinue) => {
 			this.disableSendStoppedEvents = false;
+			if(this.relocationPromise) {
+				await this.relocationPromise;
+				this.relocationPromise = null;
+			}
 			const all: Array<Promise<Breakpoint | null>> = [];
 			args.breakpoints.forEach((brk) => {
 				all.push(this.miDebugger.addBreakpoint({ raw: brk.name, condition: brk.condition, countCondition: brk.hitCondition }));
@@ -1156,6 +1181,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 				this.sendErrorResponse(response, 10, msg.toString());
 			}
 			if (shouldContinue) {
+				this.markContinuing();
 				await this.miDebugger.sendCommand('exec-continue');
 			}
 		};
@@ -1176,6 +1202,10 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	protected setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments) {
 		const createBreakpoints = async (shouldContinue: boolean) => {
 			this.debugReady = true;
+			if(this.relocationPromise) {
+				await this.relocationPromise;
+				this.relocationPromise = null;
+			}
 			const currentBreakpoints = (this.breakpointMap.get(args.source.path) || [])
 				.filter((bp) => bp.line !== undefined)
 				.map((bp) => bp.number);
@@ -1250,7 +1280,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 					if (args.breakpoints) {
 						args.breakpoints.forEach((brk) => {
 							all.push(this.miDebugger.addBreakpoint({
-								file: args.source.path || "",
+								file: (args.source.path || "").replace(/\\/g, "/"),
 								line: brk.line,
 								condition: brk.condition,
 								countCondition: brk.hitCondition
@@ -1280,6 +1310,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			}
 
 			if (shouldContinue) {
+				this.markContinuing();
 				await this.miDebugger.sendCommand('exec-continue');
 			}
 		};
@@ -1384,6 +1415,12 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			};
 			this.sendResponse(response);
 		} catch (e) {
+			if(String(e).includes('target is running')) {
+				this.markContinuing();
+				response.body = { threads: [ new Thread(1, 'Dummy') ] };
+				this.sendResponse(response);
+				return;
+			}
 			this.sendErrorResponse(response, 1, `Unable to get thread information: ${e}`);
 		}
 	}
@@ -1501,6 +1538,11 @@ export class AmigaDebugSession extends LoggingDebugSession {
 
 	protected async configurationDoneRequest(response: DebugProtocol.ConfigurationDoneResponse, args: DebugProtocol.ConfigurationDoneArguments): Promise<void> {
 		//this.handleMsg("log", `configurationDoneRequest: stopped = ${this.stopped}\n`);
+		if(this.relocationPromise) {
+			await this.relocationPromise;
+			this.relocationPromise = null;
+		}
+		this.markContinuing();
 		await this.miDebugger.continue(this.currentThreadId);
 		this.sendResponse(response);
 	}
@@ -1648,6 +1690,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	}
 
 	protected continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): void {
+		this.markContinuing();
 		this.miDebugger.continue(args.threadId).then((done) => {
 			response.body = { allThreadsContinued: true };
 			this.sendResponse(response);
@@ -1696,6 +1739,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			if(pc >= 0xF8_0000) {
 				// in Kickstart
 				await this.miDebugger.sendCommand("break-insert -t *0xffffffff");
+				this.markContinuing();
 				await this.miDebugger.sendCommand("exec-continue");
 				this.sendResponse(response);
 			} else {

@@ -54,21 +54,21 @@ export class MI2 extends EventEmitter implements IBackend {
 			this.process.on("exit", (() => { this.emit("quit"); }).bind(this));
 			this.process.on("error", ((err) => { this.emit("launcherror", err); }).bind(this));
 
-			const asyncPromise = this.sendCommand("gdb-set mi-async on", true);
-			const promises: Thenable<any>[] = commands.map((c) => this.sendCommand(c));
-			promises.push(asyncPromise);
+			const init = async () => {
+				await this.sendCommand("gdb-set mi-async on", true);
+				for (const command of commands) {
+					await this.sendCommand(command);
+				}
 
-			if(executable !== '') {
-				const sectionsPromise = this.getSections().then((sections) => {
+				if(executable !== '') {
+					const sections = await this.getSections();
 					this.emit("sections-loaded", sections);
-				});
-				promises.push(sectionsPromise);
-			}
+				}
 
-			Promise.all(promises).then(() => {
 				this.emit("debug-ready");
-				resolve();
-			}, reject);
+			};
+
+			init().then(resolve, reject);
 		});
 	}
 
@@ -366,6 +366,25 @@ export class MI2 extends EventEmitter implements IBackend {
 			});
 		}
 		return ret;
+	}
+
+	public async getOffsets(): Promise<Uint32Array> {
+		const node = await this.sendUserInput('maintenance packet qOffsets');
+		const ret: number[] = [];
+		if (node) {
+			const offsetsRegex = /received:\s*"([0-9a-fA-F;]+)"/;
+			node.output.forEach((line) => {
+				const match = offsetsRegex.exec(line);
+				if (match) {
+					match[1].split(';').forEach((offset) => {
+						if(offset.length > 0) {
+							ret.push(parseInt(offset, 16));
+						}
+					});
+				}
+			});
+		}
+		return new Uint32Array(ret);
 	}
 
 	public examineMemory(from: number, length: number): Thenable<any> {
