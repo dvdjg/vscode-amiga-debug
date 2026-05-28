@@ -595,7 +595,6 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		});
 		const commands = [
 			'enable-pretty-printing',
-			'gdb-set breakpoint always-inserted on',
 			//'interpreter-exec console "set debug remote 1"',
 			'interpreter-exec console "target remote localhost:2345"',
 		];
@@ -1682,7 +1681,8 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	}
 
 	protected pauseRequest(response: DebugProtocol.PauseResponse, args: DebugProtocol.PauseArguments): void {
-		this.miDebugger.interrupt(args.threadId).then((done) => {
+		const threadId = args.threadId || this.currentThreadId;
+		this.miDebugger.interrupt(threadId).then((done) => {
 			this.sendResponse(response);
 		}, (msg) => {
 			this.sendErrorResponse(response, 3, `Could not pause: ${msg}`);
@@ -1690,8 +1690,9 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	}
 
 	protected continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): void {
+		const threadId = args.threadId || this.currentThreadId;
 		this.markContinuing();
-		this.miDebugger.continue(args.threadId).then((done) => {
+		this.miDebugger.continue(threadId).then((done) => {
 			response.body = { allThreadsContinued: true };
 			this.sendResponse(response);
 		}, (msg) => {
@@ -1719,7 +1720,9 @@ export class AmigaDebugSession extends LoggingDebugSession {
 					}
 				}
 			}
-			const done = await (stepIn ? this.miDebugger.step(args.threadId, assemblyMode) : this.miDebugger.next(args.threadId, assemblyMode));
+			const threadId = args.threadId || this.currentThreadId;
+			this.markContinuing();
+			const done = await (stepIn ? this.miDebugger.step(threadId, assemblyMode) : this.miDebugger.next(threadId, assemblyMode));
 			this.sendResponse(response);
 		} catch (msg) {
 			this.sendErrorResponse(response, 6, `Could not step: ${msg}`);
@@ -1743,7 +1746,9 @@ export class AmigaDebugSession extends LoggingDebugSession {
 				await this.miDebugger.sendCommand("exec-continue");
 				this.sendResponse(response);
 			} else {
-				this.miDebugger.stepOut(args.threadId).then((done) => {
+				const threadId = args.threadId || this.currentThreadId;
+				this.markContinuing();
+				this.miDebugger.stepOut(threadId).then((done) => {
 					this.sendResponse(response);
 				}, (msg) => {
 					this.sendErrorResponse(response, 5, `Could not step out: ${msg}`);
