@@ -350,6 +350,64 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		}
 	}
 
+	// Relocate GDB's symbol table to the Amiga runtime addresses. When GDB
+	// connected before the program was loaded, qOffsets returned 0 and GDB keeps
+	// using ELF addresses (0x400 base). That breaks source-level stepping (its
+	// temporary step breakpoints land on ELF addresses, get relocated by
+	// WinUAE-DBG, hit, but GDB cannot match them and silently continues) and makes
+	// frames show no source file. `add-symbol-file <elf> <runtime_text_base>`
+	// teaches GDB the runtime addresses non-destructively (the process keeps
+	// running); file:line breakpoints then resolve to the runtime location too.
+	// Returns false if it failed (the caller falls back to the previous behaviour).
+	private async relocateGdbSymbols(): Promise<boolean> {
+		if (!this.gdbSymbolsUnrelocated || this.loadOffset <= 0 || !this.args) {
+			return false;
+		}
+		try {
+			const runtimeTextBase = 0x400 + this.loadOffset;
+			this.trace('relocateGdbSymbols: add-symbol-file at 0x' + runtimeTextBase.toString(16));
+
+			// Remove the stale single-location breakpoints first, otherwise both the
+			// old (ELF) and the new (runtime) locations would hit.
+			const numbers: number[] = [];
+			for (const [, bps] of this.breakpointMap) {
+				for (const bp of bps) {
+					if (bp.number !== undefined && !numbers.includes(bp.number)) {
+						numbers.push(bp.number);
+					}
+				}
+			}
+			if (numbers.length > 0) {
+				await this.miDebugger.removeBreakpoints(numbers);
+			}
+			this.breakpointMap.clear();
+
+			const elfPath = (this.args.program + '.elf').replace(/\\/g, '/');
+			await this.miDebugger.sendUserInput(`add-symbol-file "${elfPath}" 0x${runtimeTextBase.toString(16)}`);
+
+			this.gdbSymbolsUnrelocated = false;
+			this.relocatedBreakpointAddresses = [];
+
+			// Re-establish user breakpoints: file:line now resolves to the runtime
+			// location too, so they hit as real breakpoint-hits and source stepping
+			// works.
+			for (const pending of this.pendingBreakpoints) {
+				await this.miDebugger.addBreakpoint({
+					file: pending.file,
+					line: pending.line,
+					condition: pending.condition,
+					countCondition: pending.hitCondition
+				});
+			}
+			this.pendingBreakpoints = [];
+			this.trace('relocateGdbSymbols: ok, GDB symbols relocated');
+			return true;
+		} catch (e) {
+			this.trace('relocateGdbSymbols error: ' + e);
+			return false;
+		}
+	}
+
 	protected initDebugger() {
 		this.miDebugger.on('launcherror', this.launchErrorEvent.bind(this));
 		this.miDebugger.on('quit', this.quitEvent.bind(this));
@@ -1343,14 +1401,27 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			this.stoppedReason = 'breakpoint';
 			await this.ensureLoadOffset();
 
+			// This is the process-entry stop that WinUAE-DBG forces when GDB
+			// connected before the program was loaded (qOffsets was 0). Best fix:
+			// teach GDB the runtime addresses via add-symbol-file, which makes
+			// source-level stepping and line resolution work natively.
+			if (this.gdbSymbolsUnrelocated && this.loadOffset > 0) {
+				const relocated = await this.relocateGdbSymbols();
+				if (relocated) {
+					this.trace('signal SIGTRAP = process-entry stop -> GDB relocated via add-symbol-file; auto-continue');
+					this.stopped = false;
+					this.stopSurfaced = false;
+					await this.miDebugger.continue(this.currentThreadId);
+					return;
+				}
+			}
+
 			const pc = this.extractPcFromStop(info);
 			const isUserBreakpoint = pc !== null && this.relocatedBreakpointAddresses.some((a) => Math.abs(a - pc) <= 4);
 			if (!isUserBreakpoint && pc !== null && this.relocatedBreakpointAddresses.length > 0) {
-				// This is the process-entry stop that WinUAE-DBG forces when GDB
-				// connected before the program was loaded (qOffsets was 0). GDB would
-				// otherwise silently auto-continue it. We have now relocated the user
-				// breakpoints to runtime addresses, so resume: the user's breakpoints
-				// will fire as proper breakpoint-hits afterwards.
+				// Fallback (no reconnect): resume after relocating the user
+				// breakpoints to runtime addresses; they will fire as proper
+				// breakpoint-hits afterwards.
 				this.trace('signal SIGTRAP at 0x' + pc.toString(16) + ' = process-entry stop -> auto-continue after relocating ' + this.relocatedBreakpointAddresses.length + ' bps');
 				this.stopped = false;
 				this.stopSurfaced = false;
