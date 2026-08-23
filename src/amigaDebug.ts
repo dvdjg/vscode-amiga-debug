@@ -123,7 +123,32 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	private stoppedReason = '';
 	private stoppedEventPending = false;
 
+	// True when a user-visible StoppedEvent was actually emitted for the current
+	// stop. Used by configurationDone to avoid resuming a real breakpoint that
+	// arrived before DAP finished configuring, while still auto-resuming the
+	// initial server stop (which WinUAE-DBG suppresses at process entry).
+	private stopSurfaced = false;
+	// True when GDB's qOffsets at connect time was 0, i.e. GDB's symbol table is
+	// still using ELF addresses (0x400 base) because the program had not loaded
+	// yet. In that case breakpoints GDB resolves from file:line are ELF-based and
+	// must be relocated to runtime addresses before GDB can match a stop as a
+	// breakpoint-hit.
+	private gdbSymbolsUnrelocated = true;
+	// Runtime addresses of the breakpoints re-established by relocateBreakpoints().
+	// Used to tell a genuine user-breakpoint stop from the forced process-entry
+	// stop (WinUAE-DBG sends a plain S05 at entry when GDB was unrelocated).
+	private relocatedBreakpointAddresses: number[] = [];
+
 	private currentFile: string;
+
+	// Append-only trace to %TEMP%\amiga-debug-trace.log for diagnosing the DAP
+	// stop/continue flow without needing DevTools. Safe no-op on failure.
+	private trace(...args: any[]) {
+		try {
+			const line = `[${new Date().toISOString()}] ` + args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+			fs.appendFileSync(path.join(os.tmpdir(), 'amiga-debug-trace.log'), line + '\n');
+		} catch (e) { /* ignore */ }
+	}
 
 	public constructor() {
 		super("amiga-debug.txt");
@@ -194,8 +219,9 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			
 			// Parse the response to extract the address
 			// Format: "Line X of \"file\" starts at address 0xADDR ..."
+			// Format (no code at line): "Line X of \"file\" is at address 0xADDR ... but contains no code"
 			const output = result.result('~') || '';
-			const match = output.match(/starts at address (0x[0-9a-fA-F]+)/);
+			const match = output.match(/(?:starts at address|is at address)\s+(0x[0-9a-fA-F]+)/);
 			if (match) {
 				const addr = parseInt(match[1], 16);
 				console.log(`getAddressForFileLine: Found address 0x${addr.toString(16)} for ${file}:${line}`);
@@ -207,13 +233,40 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		return null;
 	}
 
-	// Re-establish breakpoints with relocated addresses after loadOffset is known
+	// Re-establish breakpoints with relocated addresses after loadOffset is known.
+	// Only meaningful when GDB's symbol table is unrelocated (gdbSymbolsUnrelocated):
+	// its file:line breakpoints resolve to ELF addresses, so re-creating them as raw
+	// runtime addresses lets GDB report a real breakpoint-hit instead of SIGTRAP.
 	private async relocateBreakpoints(): Promise<void> {
 		if (this.pendingBreakpoints.length === 0 || this.loadOffset <= 0) {
 			return;
 		}
 		
 		console.log(`relocateBreakpoints: Relocating ${this.pendingBreakpoints.length} pending breakpoints with loadOffset=0x${this.loadOffset.toString(16)}`);
+		this.relocatedBreakpointAddresses = [];
+
+		// Remove the old file:line breakpoints GDB created against its unrelocated
+		// symbol table, otherwise the same runtime address ends up covered twice
+		// (one stale SIGTRAP stop, one breakpoint-hit stop).
+		try {
+			const numbers: number[] = [];
+			for (const [srcPath, bps] of this.breakpointMap) {
+				if (bps.some((bp) => bp.line !== undefined)) {
+					for (const bp of bps) {
+						if (bp.number !== undefined && !numbers.includes(bp.number)) {
+							numbers.push(bp.number);
+						}
+					}
+				}
+			}
+			if (numbers.length > 0) {
+				console.log(`relocateBreakpoints: Removing ${numbers.length} stale file:line breakpoints ${numbers.join(',')}`);
+				await this.miDebugger.removeBreakpoints(numbers);
+			}
+			this.breakpointMap.clear();
+		} catch (e) {
+			console.log(`relocateBreakpoints: failed to remove stale breakpoints: ${e}`);
+		}
 		
 		for (const pending of this.pendingBreakpoints) {
 			try {
@@ -222,11 +275,16 @@ export class AmigaDebugSession extends LoggingDebugSession {
 					const amigaAddr = elfAddr + this.loadOffset;
 					console.log(`relocateBreakpoints: ${pending.file}:${pending.line} -> ELF 0x${elfAddr.toString(16)} -> Amiga 0x${amigaAddr.toString(16)}`);
 					
-					// Remove old breakpoint and add new one with absolute address
-					await this.miDebugger.addBreakpoint({
+					const bp = await this.miDebugger.addBreakpoint({
 						raw: `0x${amigaAddr.toString(16)}`,
-						condition: pending.condition
+						condition: pending.condition,
+						countCondition: pending.hitCondition
 					});
+					if (bp) {
+						this.relocatedBreakpointAddresses.push(amigaAddr);
+						const existing = this.breakpointMap.get(pending.file) || [];
+						this.breakpointMap.set(pending.file, [...existing, bp]);
+					}
 				}
 			} catch (e) {
 				console.log(`relocateBreakpoints error for ${pending.file}:${pending.line}: ${e}`);
@@ -241,6 +299,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	// but AUTODETECT in WinUAE should have detected baseText by the time we hit a breakpoint
 	private async refreshLoadOffset(): Promise<void> {
 		const ELF_TEXT_BASE = 0x400;
+		this.trace('refreshLoadOffset: querying qOffsets');
 		try {
 			const qOffsetsNode = await this.miDebugger.sendUserInput('maintenance packet qOffsets');
 			console.log(`refreshLoadOffset: qOffsets raw output: ${JSON.stringify(qOffsetsNode?.output)}`);
@@ -264,6 +323,13 @@ export class AmigaDebugSession extends LoggingDebugSession {
 					// Also update symbolTable
 					if (this.loadOffset > 0) {
 						this.symbolTable.relocateWithOffset(this.loadOffset);
+						// Only now that we know the runtime base, re-establish any
+						// breakpoints GDB resolved against its unrelocated (ELF)
+						// symbol table, so future stops are reported as real
+						// breakpoint-hits and GDB can match the runtime PC.
+						if (this.gdbSymbolsUnrelocated) {
+							await this.relocateBreakpoints();
+						}
 					}
 				} else {
 					console.log(`refreshLoadOffset: qOffsets regex did not match`);
@@ -271,6 +337,16 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			}
 		} catch (e) {
 			console.log(`refreshLoadOffset: Failed to get qOffsets: ${e}`);
+		}
+	}
+
+	// Ensure loadOffset is known before source mapping. Called from every stop
+	// handler: when GDB connected before the Amiga program was loaded, qOffsets
+	// returned 0 and this re-queries it now that the process is running.
+	private async ensureLoadOffset(): Promise<void> {
+		if (this.loadOffset <= 0) {
+			this.trace('ensureLoadOffset: loadOffset<=0, refreshing via qOffsets');
+			await this.refreshLoadOffset();
 		}
 	}
 
@@ -289,6 +365,11 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		this.miDebugger.on('thread-created', this.threadCreatedEvent.bind(this));
 		this.miDebugger.on('thread-exited', this.threadExitedEvent.bind(this));
 		this.miDebugger.on('thread-selected', this.threadSelectedEvent.bind(this));
+		// Safety net: whatever MI stop reason GDB reports (breakpoint-hit,
+		// signal-received, or even a reason-less *stopped for an unmatched software
+		// breakpoint), always make sure loadOffset is known so source mapping via
+		// addr2line can run.
+		this.miDebugger.on('generic-stopped', () => { void this.ensureLoadOffset(); });
 		this.sendEvent(new InitializedEvent());
 	}
 
@@ -308,6 +389,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	}
 
 	protected async launchRequest(response: DebugProtocol.LaunchResponse, args: LaunchRequestArguments): Promise<void> {
+		this.trace('launchRequest: program=' + args.program, 'config=' + (args.config || 'A500'), 'breakpointRelocation=' + args.breakpointRelocation);
 		logger.setup(Logger.LogLevel.Warn, false);
 		if(DEBUG)
 			logger.setup(Logger.LogLevel.Verbose, false);
@@ -741,17 +823,21 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			if(sections.length > 0) {
 				// Store loadOffset for address conversion in stack traces
 				this.loadOffset = loadOffset ?? 0;
+				// If qOffsets was 0 at connect time, GDB's own symbols are still at
+				// ELF addresses; its file:line breakpoints must be relocated later.
+				this.gdbSymbolsUnrelocated = !(loadOffset && loadOffset > 0);
+				this.trace('sections-loaded', 'loadOffset=0x' + this.loadOffset.toString(16), 'gdbSymbolsUnrelocated=' + this.gdbSymbolsUnrelocated, 'started=' + this.started, 'stopped=' + this.stopped);
 				
 				// Use loadOffset for more reliable relocation if available
 				if(loadOffset && loadOffset > 0) {
 					console.log(`amigaDebug: Using relocateWithOffset(0x${loadOffset.toString(16)})`);
 					this.symbolTable.relocateWithOffset(loadOffset);
-					
-					// OPTION A: Re-establish pending breakpoints with relocated addresses
-					if(this.breakpointRelocationEnabled && this.pendingBreakpoints.length > 0) {
-						console.log(`amigaDebug: Relocating ${this.pendingBreakpoints.length} pending breakpoints...`);
-						await this.relocateBreakpoints();
-					}
+					// NOTE: pending breakpoints are NOT relocated here. When loadOffset
+					// is already known at connect time, GDB has relocated its own
+					// symbols, so its file:line breakpoints already resolve to runtime
+					// addresses; adding loadOffset again would double-shift them. They
+					// are only re-established (as raw runtime addresses) when GDB is
+					// known to be unrelocated, from refreshLoadOffset().
 				} else {
 					console.log(`amigaDebug: Using relocate() with section names`);
 					this.symbolTable.relocate(sections);
@@ -1188,45 +1274,55 @@ export class AmigaDebugSession extends LoggingDebugSession {
 
 	// events from miDebugger
 	protected runningEvent(info: MINode) {
+		this.trace('runningEvent: continuing (stopped=false, stopSurfaced reset)');
 		this.stopped = false;
+		this.stopSurfaced = false;
 		this.sendEvent(new ContinuedEvent(this.currentThreadId));
 		this.sendEvent(new CustomContinuedEvent(this.currentThreadId, true));
 	}
 
 	protected async breakpointEvent(info: MINode) {
+		this.trace('stop: breakpoint-hit (bpEvent) stopped=' + this.stopped, 'disableSendStoppedEvents=' + this.disableSendStoppedEvents);
 		this.stopped = true;
 		this.stoppedReason = 'breakpoint';
 		
 		// FIX: If loadOffset is 0, try to re-query qOffsets now that we've hit a breakpoint
 		// The process should be loaded and AUTODETECT in WinUAE should have detected baseText
-		if (this.loadOffset <= 0) {
-			console.log('breakpointEvent: loadOffset is 0, re-querying qOffsets...');
-			await this.refreshLoadOffset();
-		}
+		await this.ensureLoadOffset();
 		
 		if(!this.disableSendStoppedEvents) {
+			this.stopSurfaced = true;
+			this.trace('  breakpoint-hit -> sending StoppedEvent');
 			this.sendEvent(new StoppedEvent(this.stoppedReason, this.currentThreadId));
 			this.sendEvent(new CustomStoppedEvent(this.stoppedReason, this.currentThreadId));
 		} else {
 			this.stoppedEventPending = true;
+			this.trace('  breakpoint-hit -> swallowed (pending)');
 		}
 	}
 
 	protected watchpointEvent(info: MINode) {
+		this.trace('stop: watchpoint-trigger stopped=' + this.stopped, 'disableSendStoppedEvents=' + this.disableSendStoppedEvents);
 		this.stopped = true;
 		this.stoppedReason = 'data breakpoint';
+		void this.ensureLoadOffset();
 		if(!this.disableSendStoppedEvents) {
+			this.stopSurfaced = true;
+			this.trace('  watchpoint -> sending StoppedEvent');
 			this.sendEvent(new StoppedEvent(this.stoppedReason, this.currentThreadId));
 			this.sendEvent(new CustomStoppedEvent(this.stoppedReason, this.currentThreadId));
 		} else {
 			this.stoppedEventPending = true;
+			this.trace('  watchpoint -> swallowed (pending)');
 		}
 	}
 
 	protected stepEndEvent(info: MINode) {
+		this.trace('stop: step-end stopped=' + this.stopped, 'disableSendStoppedEvents=' + this.disableSendStoppedEvents);
 		this.stopped = true;
 		this.stoppedReason = 'step';
 		if(!this.disableSendStoppedEvents) {
+			this.stopSurfaced = true;
 			this.sendEvent(new StoppedEvent(this.stoppedReason, this.currentThreadId));
 			this.sendEvent(new CustomStoppedEvent(this.stoppedReason, this.currentThreadId));
 		} else {
@@ -1234,10 +1330,34 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		}
 	}
 
-	protected signalStopEvent(info: MINode) {
+	protected async signalStopEvent(info: MINode) {
 		const signalName = info.record('signal-name');
 		//const signalMeaning = info.record('signal-meaning');
-		if(signalName === 'SIGEMT')
+		this.trace('stop: signal-received', 'signal=' + signalName, 'stopped=' + this.stopped, 'disableSendStoppedEvents=' + this.disableSendStoppedEvents, 'stopSurfaced=' + this.stopSurfaced);
+		if(signalName === 'SIGTRAP') {
+			// GDB reports WinUAE-DBG software breakpoints as SIGTRAP when it cannot
+			// match the runtime PC against its own (unrelocated) breakpoint list,
+			// i.e. the common case where GDB connected before the program loaded.
+			// Make sure loadOffset is known and re-establish the user breakpoints at
+			// runtime addresses so subsequent hits are reported as breakpoint-hit.
+			this.stoppedReason = 'breakpoint';
+			await this.ensureLoadOffset();
+
+			const pc = this.extractPcFromStop(info);
+			const isUserBreakpoint = pc !== null && this.relocatedBreakpointAddresses.some((a) => Math.abs(a - pc) <= 4);
+			if (!isUserBreakpoint && pc !== null && this.relocatedBreakpointAddresses.length > 0) {
+				// This is the process-entry stop that WinUAE-DBG forces when GDB
+				// connected before the program was loaded (qOffsets was 0). GDB would
+				// otherwise silently auto-continue it. We have now relocated the user
+				// breakpoints to runtime addresses, so resume: the user's breakpoints
+				// will fire as proper breakpoint-hits afterwards.
+				this.trace('signal SIGTRAP at 0x' + pc.toString(16) + ' = process-entry stop -> auto-continue after relocating ' + this.relocatedBreakpointAddresses.length + ' bps');
+				this.stopped = false;
+				this.stopSurfaced = false;
+				await this.miDebugger.continue(this.currentThreadId);
+				return;
+			}
+		} else if(signalName === 'SIGEMT')
 			this.stoppedReason = 'TRAP #7 (undefined behavior)';
 		else if(signalName === 'SIGSEGV')
 			this.stoppedReason = 'NULL access (undefined behavior)';
@@ -1249,11 +1369,28 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			this.stoppedReason = 'user request';
 		this.stopped = true;
 		if(!this.disableSendStoppedEvents) {
+			this.stopSurfaced = true;
+			this.trace('  signal ' + signalName + ' -> sending StoppedEvent reason=' + this.stoppedReason);
 			this.sendEvent(new StoppedEvent(this.stoppedReason, this.currentThreadId));
 			this.sendEvent(new CustomStoppedEvent(this.stoppedReason, this.currentThreadId));
 		} else {
 			this.stoppedEventPending = true;
+			this.trace('  signal ' + signalName + ' -> swallowed (pending)');
 		}
+	}
+
+	// Extract the PC (as a number) from a MI *stopped record's frame, if present.
+	private extractPcFromStop(info: MINode): number | null {
+		try {
+			const frame = info.record("frame");
+			if (frame) {
+				const addr = MINode.valueOf(frame, "addr");
+				if (addr && /^0x[0-9a-fA-F]+$/i.test(addr)) {
+					return parseInt(addr.substr(2), 16);
+				}
+			}
+		} catch (e) { /* ignore */ }
+		return null;
 	}
 
 	protected threadCreatedEvent(info: { threadId: number; threadGroupId: number }) {
@@ -1271,6 +1408,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	}
 
 	protected stopEvent(info: MINode) {
+		this.trace('stop: generic (no reason) stopped=' + this.stopped, 'firstBreak=' + this.firstBreak, 'started=' + this.started, 'disableSendStoppedEvents=' + this.disableSendStoppedEvents);
 		if (!this.started) { this.crashed = true; }
 		if (!this.quit) {
 			if(this.firstBreak) {
@@ -1282,6 +1420,12 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			} else {
 				this.stopped = true;
 				this.stoppedReason = 'exception';
+				// GDB may emit a reason-less *stopped for a WinUAE-DBG software
+				// breakpoint it could not match (unrelocated symbol table). Make sure
+				// loadOffset is known so the source is still resolved via addr2line.
+				void this.ensureLoadOffset();
+				this.stopSurfaced = true;
+				this.trace('  generic stop -> sending StoppedEvent (exception)');
 				this.sendEvent(new StoppedEvent(this.stoppedReason, this.currentThreadId));
 				this.sendEvent(new CustomStoppedEvent(this.stoppedReason, this.currentThreadId));
 			}
@@ -1339,14 +1483,17 @@ export class AmigaDebugSession extends LoggingDebugSession {
 				this.sendErrorResponse(response, 10, msg.toString());
 			}
 			if (shouldContinue) {
+				this.trace('createBreakpoints: exec-continue (shouldContinue=true)');
 				await this.miDebugger.sendCommand('exec-continue');
 			}
 		};
 
 		const process = async () => {
 			if (this.stopped) {
+				this.trace('setBreakPoints: target stopped -> createBreakpoints(false)');
 				await createBreakpoints(false);
 			} else {
+				this.trace('setBreakPoints: target running -> interrupt dance');
 				this.disableSendStoppedEvents = true;
 				this.miDebugger.once('generic-stopped', () => { void createBreakpoints(true); });
 				void this.miDebugger.sendCommand('exec-interrupt');
@@ -1357,8 +1504,10 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	}
 
 	protected setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments) {
+		this.trace('setBreakPointsRequest:', (args.source && args.source.path) || '', (args.breakpoints || []).map((b) => b.line).join(','));
 		const createBreakpoints = async (shouldContinue: boolean) => {
 			this.debugReady = true;
+			this.trace('createBreakpoints(shouldContinue=' + shouldContinue + ') disableSendStoppedEvents was ' + this.disableSendStoppedEvents);
 			const currentBreakpoints = (this.breakpointMap.get(args.source.path) || [])
 				.filter((bp) => bp.line !== undefined)
 				.map((bp) => bp.number);
@@ -1581,11 +1730,20 @@ export class AmigaDebugSession extends LoggingDebugSession {
 			};
 			this.sendResponse(response);
 		} catch (e) {
-			this.sendErrorResponse(response, 1, `Unable to get thread information: ${e}`);
+			// The target can resume between the stopped event and VS Code's
+			// thread-list request. Keep the session usable instead of surfacing a
+			// transient GDB "target is running" error.
+			if (!this.stopped) {
+				response.body = { threads: [ new Thread(1, 'Dummy') ] };
+				this.sendResponse(response);
+			} else {
+				this.sendErrorResponse(response, 1, `Unable to get thread information: ${e}`);
+			}
 		}
 	}
 
 	protected async stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
+		this.trace('stackTraceRequest thread=' + args.threadId, 'startFrame=' + args.startFrame, 'levels=' + args.levels, 'stopped=' + this.stopped, 'disableSendStoppedEvents=' + this.disableSendStoppedEvents);
 		if ((this.stopped === false) || this.disableSendStoppedEvents) {
 			// Mar 20, 2020: A recent change in VSCode changed order of things. It is asking for stack traces when we are running
 			// happens at the start of the session and runToMain is enabled. This causes falses popups/errors
@@ -1611,9 +1769,14 @@ export class AmigaDebugSession extends LoggingDebugSession {
 				let file;
 				let line = element.line;
 				let disassemble = this.forceDisassembly || element.file === undefined;
+				this.trace('stackTrace frame', element.address, 'file=' + (element.file || '(none)'), 'line=' + line, 'func=' + element.function);
 				
 				// If GDB doesn't have file info, try to get it from addr2line
 				if (disassemble && !this.forceDisassembly && element.file === undefined) {
+					// Make sure loadOffset is known: if GDB connected before the
+					// program loaded, qOffsets returned 0 and the addr2line fallback
+					// would otherwise never run (showing disassembly instead of source).
+					await this.ensureLoadOffset();
 					const address = parseInt(element.address.substr(2), 16);
 					const sourceInfo = this.getSourceInfoFromAddress(address);
 					if (sourceInfo) {
@@ -1623,7 +1786,10 @@ export class AmigaDebugSession extends LoggingDebugSession {
 						disassemble = !(await this.checkFileExists(file));
 						if (!disassemble) {
 							console.log(`stackTrace: Using addr2line for 0x${address.toString(16)} -> ${file}:${line}`);
+							this.trace('stackTrace: addr2line OK', file + ':' + line);
 						}
+					} else {
+						this.trace('stackTrace: addr2line returned nothing for 0x' + address.toString(16), 'loadOffset=0x' + this.loadOffset.toString(16));
 					}
 				}
 				
@@ -1714,8 +1880,16 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	}
 
 	protected async configurationDoneRequest(response: DebugProtocol.ConfigurationDoneResponse, args: DebugProtocol.ConfigurationDoneArguments): Promise<void> {
-		//this.handleMsg("log", `configurationDoneRequest: stopped = ${this.stopped}\n`);
-		await this.miDebugger.continue(this.currentThreadId);
+		// Resume only if the target is running, or if the only stop seen so far was
+		// the initial server stop (not surfaced to the user). A real breakpoint that
+		// arrived before DAP finished configuration must NOT be resumed, otherwise
+		// the user would never see it. The initial server stop is suppressed by
+		// WinUAE-DBG, so in the common case this just continues the boot.
+		const willContinue = !this.stopped || !this.stopSurfaced;
+		this.trace('configurationDone: stopped=' + this.stopped, 'stopSurfaced=' + this.stopSurfaced, 'firstBreak=' + this.firstBreak, 'willContinue=' + willContinue);
+		if (willContinue) {
+			await this.miDebugger.continue(this.currentThreadId);
+		}
 		this.sendResponse(response);
 	}
 
@@ -1862,6 +2036,7 @@ export class AmigaDebugSession extends LoggingDebugSession {
 	}
 
 	protected continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): void {
+		this.trace('continueRequest (user pressed Continue)');
 		this.miDebugger.continue(args.threadId).then((done) => {
 			response.body = { allThreadsContinued: true };
 			this.sendResponse(response);

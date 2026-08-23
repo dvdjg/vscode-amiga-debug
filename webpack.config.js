@@ -16,7 +16,7 @@ module.exports = (env, argv) => {
 		target: 'node',
 		entry: {
 			extension: './src/extension.ts',
-			debugAdapter: { import: './src/debugAdapter.ts', dependOn: 'extension' }
+			debugAdapter: './src/debugAdapter.ts'
 		},
 		output: {
 			filename: '[name].js',

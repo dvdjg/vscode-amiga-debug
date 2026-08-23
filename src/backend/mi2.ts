@@ -2,6 +2,7 @@ import * as cp from "child_process";
 import { EventEmitter } from "events";
 import * as fs from "fs";
 import * as net from "net";
+import * as os from "os";
 import { posix } from "path";
 import * as nativePath from "path";
 import { Breakpoint, IBackend, MIError, Stack, Variable, VariableObject, Watchpoint } from "./backend";
@@ -503,6 +504,12 @@ export class MI2 extends EventEmitter implements IBackend {
 
 	public sendCommand(command: string, suppressFailure = false): Thenable<MINode> {
 		const sel = this.currentToken++;
+		try {
+			if (/^(exec-continue|exec-interrupt|exec-step|exec-next|exec-finish)/.test(command)) {
+				fs.appendFileSync(nativePath.join(os.tmpdir(), "amiga-debug-trace.log"),
+					"[" + new Date().toISOString() + "] MI CMD: " + command + "\n");
+			}
+		} catch (e) { /* ignore */ }
 		return new Promise((resolve, reject) => {
 			this.handlers[sel] = (node: MINode) => {
 				if (node && node.resultRecords && node.resultRecords.resultClass === "error") {
@@ -623,6 +630,14 @@ export class MI2 extends EventEmitter implements IBackend {
 									const reason = parsed.record("reason");
 									if (this.trace)
 										this.log("log", "stop: " + reason);
+									try {
+										// File trace: the extension host may not flush the
+										// "Amiga" output channel; use a file so we can always
+										// diagnose which MI stop reason GDB reported.
+										const rec = JSON.stringify(parsed);
+										fs.appendFileSync(nativePath.join(os.tmpdir(), "amiga-debug-trace.log"),
+											"[" + new Date().toISOString() + "] MI *stopped reason=" + reason + " " + rec.slice(0, 400) + "\n");
+									} catch (e) { /* ignore */ }
 									if (reason === "breakpoint-hit") {
 										this.emit("breakpoint", parsed);
 									} else if (reason === "watchpoint-trigger") {
