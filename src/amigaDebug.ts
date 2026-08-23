@@ -270,8 +270,14 @@ export class AmigaDebugSession extends LoggingDebugSession {
 		
 		for (const pending of this.pendingBreakpoints) {
 			try {
-				const elfAddr = await this.getAddressForFileLine(pending.file, pending.line);
+				let elfAddr = await this.getAddressForFileLine(pending.file, pending.line);
 				if (elfAddr !== null) {
+					// `info line` while GDB is unrelocated (qOffsets=0) returns the
+					// "text base 0" convention (ELF address - 0x400). Restore the real
+					// ELF address before applying the load offset.
+					if (this.gdbSymbolsUnrelocated) {
+						elfAddr += 0x400;
+					}
 					const amigaAddr = elfAddr + this.loadOffset;
 					console.log(`relocateBreakpoints: ${pending.file}:${pending.line} -> ELF 0x${elfAddr.toString(16)} -> Amiga 0x${amigaAddr.toString(16)}`);
 					
@@ -323,13 +329,12 @@ export class AmigaDebugSession extends LoggingDebugSession {
 					// Also update symbolTable
 					if (this.loadOffset > 0) {
 						this.symbolTable.relocateWithOffset(this.loadOffset);
-						// Only now that we know the runtime base, re-establish any
-						// breakpoints GDB resolved against its unrelocated (ELF)
-						// symbol table, so future stops are reported as real
-						// breakpoint-hits and GDB can match the runtime PC.
-						if (this.gdbSymbolsUnrelocated) {
-							await this.relocateBreakpoints();
-						}
+						// NOTE: pendingBreakpoints are NOT relocated here. The primary
+						// relocation path is relocateGdbSymbols() (add-symbol-file),
+						// called from signalStopEvent at the process-entry stop, which
+						// consumes pendingBreakpoints itself. Calling relocateBreakpoints()
+						// here would clear pendingBreakpoints prematurely and compute
+						// raw addresses 0x400 short (GDB's "text base 0" convention).
 					}
 				} else {
 					console.log(`refreshLoadOffset: qOffsets regex did not match`);
