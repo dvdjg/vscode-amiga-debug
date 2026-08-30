@@ -1,8 +1,9 @@
 import { swizzle } from "../utils";
 import { CopperInstruction, CopperInstructionType, CopperMove } from "./copperDisassembler";
 import { CustomReadWrite, Custom, DMACONFlags, FMODEFlags, BPLCON3Flags, BPLCON0Flags, BPLCON2Flags, BPLCON0Bits } from "./custom";
-import { ChipsetFlags, CpuCyclesToDmaCycles, displayLeft, displayTop, DmaSubTypes, dmaTypes, DmaTypes, GetOcsColor, GetEhbColor, GetMemoryAfterDma, Memory, NR_DMA_REC_HPOS, NR_DMA_REC_VPOS, OcsToAga, GetAgaColor, ColorSwap } from "./dma";
+import { ChipsetFlags, CpuCyclesToDmaCycles, displayLeft, displayTop, DmaSubTypes, dmaTypes, DmaTypes, GetOcsColor, GetEhbColor, GetMemoryAfterDma, GetAgaColorsAfterDma, Memory, NR_DMA_REC_HPOS, NR_DMA_REC_VPOS, OcsToAga, GetAgaColor, ColorSwap } from "./dma";
 import { IProfileModel } from "./model";
+import { DmaRecord } from "../backend/profile_types";
 
 export interface DeniseState {
 	freeze: number;
@@ -101,6 +102,15 @@ function GetCopperTypeForReg(reg: number): CopperType {
 	if(Custom.IsBitplane(reg)) return copperTypes.get(CopperTypes.BITPLANE);
 	if(Custom.IsSprite(reg)) return copperTypes.get(CopperTypes.SPRITE);
 	return copperTypes.get(CopperTypes.MOVE);
+}
+
+/** Seed Denise color lookup before DMA replay (fixes blank / grayscale Screen on AGA profiles). */
+function initDenisePalette(customRegs: number[], agaColors: number[] | undefined, dmaRecords: DmaRecord[]): Uint32Array {
+	const colors = new Uint32Array(256);
+	const seeded = GetAgaColorsAfterDma(customRegs, agaColors ?? [], dmaRecords, 0xffffffff);
+	for (let i = 0; i < 256; i++)
+		colors[i] = seeded[i] ?? 0;
+	return colors;
 }
 
 export function getScreen(scale: number, model: IProfileModel, freezeModel: IProfileModel, time: number, state: DeniseState): [Uint8Array, Uint32Array, Uint8Array, Uint32Array, Uint32Array, Uint32Array] {
@@ -214,7 +224,7 @@ export function getScreen(scale: number, model: IProfileModel, freezeModel: IPro
 	const customRegs = freezeModel.amiga.customRegs.slice(); // initial copy
 	const memory = new Memory(model.memory.chipMem.slice(), new Uint8Array()); // initial copy
 	const lastUpdate = new Uint32Array(memory.chipMem.byteLength);
-	const colors = new Uint32Array(256);
+	const colors = initDenisePalette(customRegs, freezeModel.amiga.agaColors, freezeModel.amiga.dmaRecords);
 
 	let vpos = -1;
 	let hpos = 0;
@@ -261,11 +271,19 @@ export function getScreen(scale: number, model: IProfileModel, freezeModel: IPro
 		}
 	}
 	
-	// process frozen memory
-	for(let cycleY = 0; cycleY < NR_DMA_REC_VPOS; cycleY++) {
+	// process frozen memory (Live: partial DMA replay for CRT sweep while scrubbing the timeline)
+	const totalDmaCycles = NR_DMA_REC_HPOS * NR_DMA_REC_VPOS;
+	const liveMaxDmaCycle = freeze
+		? totalDmaCycles
+		: Math.max(NR_DMA_REC_HPOS, Math.min(totalDmaCycles, CpuCyclesToDmaCycles(time) + 1));
+
+	dmaLoop: for(let cycleY = 0; cycleY < NR_DMA_REC_VPOS; cycleY++) {
 		for(let cycleX = 0; cycleX < NR_DMA_REC_HPOS; cycleX++) {
+			const cycleIndex = cycleY * NR_DMA_REC_HPOS + cycleX;
+			if(!freeze && cycleIndex >= liveMaxDmaCycle)
+				break dmaLoop;
 			// this is per 2 lores pixels
-			const dmaRecord = freezeModel.amiga.dmaRecords[cycleY * NR_DMA_REC_HPOS + cycleX];
+			const dmaRecord = freezeModel.amiga.dmaRecords[cycleIndex];
 			// see dma.ts@GetCustomRegsAfterDma
 			if(!(dmaRecord.addr === undefined || dmaRecord.addr === 0xffffffff)) {
 				// skip 2 fake instructions after copper jump
